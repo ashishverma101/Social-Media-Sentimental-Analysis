@@ -9,6 +9,9 @@ import pandas as pd
 import plotly.express as px
 from datetime import datetime, timedelta
 import os
+import time
+from textblob import TextBlob
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -34,6 +37,56 @@ CATEGORY_LABELS = {
     "askstories":  "❓ Ask HN",
     "showstories": "🚀 Show HN",
 }
+TEXT_COLUMN_ALIASES = ("title", "text", "tweet", "tweet_text", "full_text", "content", "comment", "message", "post")
+vader = SentimentIntensityAnalyzer()
+
+
+def find_text_column(df):
+    normalized = {str(column).strip().lower(): column for column in df.columns}
+    for alias in TEXT_COLUMN_ALIASES:
+        if alias in normalized:
+            return normalized[alias]
+    return None
+
+
+def label_sentiment(score):
+    if score >= 0.05:
+        return "positive"
+    if score <= -0.05:
+        return "negative"
+    return "neutral"
+
+
+def build_uploaded_dataframe(file):
+    df = pd.read_csv(file)
+    text_col = find_text_column(df)
+    if text_col is None:
+        st.error("CSV must include a title, text, tweet, content, comment, message, or post column.")
+        st.stop()
+
+    out = df.copy()
+    out["title"] = out[text_col].astype(str)
+    out["subreddit"] = out.get("subreddit", out.get("platform", "uploaded"))
+    out["score"] = pd.to_numeric(out.get("score", 0), errors="coerce").fillna(0)
+    out["num_comments"] = pd.to_numeric(out.get("num_comments", 0), errors="coerce").fillna(0)
+    if "fetched_at" in out.columns:
+        out["fetched_at"] = pd.to_datetime(out["fetched_at"], errors="coerce").fillna(datetime.utcnow())
+    else:
+        out["fetched_at"] = datetime.utcnow()
+    out["category_label"] = out["subreddit"].map(CATEGORY_LABELS).fillna(out["subreddit"])
+
+    if "vader_compound" not in out.columns:
+        out["vader_compound"] = out["title"].apply(lambda value: vader.polarity_scores(str(value))["compound"])
+    out["vader_compound"] = pd.to_numeric(out["vader_compound"], errors="coerce").fillna(0)
+
+    if "sentiment_label" not in out.columns:
+        out["sentiment_label"] = out["vader_compound"].apply(label_sentiment)
+    out["sentiment_label"] = out["sentiment_label"].astype(str).str.lower()
+
+    if "tb_polarity" not in out.columns:
+        out["tb_polarity"] = out["title"].apply(lambda value: TextBlob(str(value)).sentiment.polarity)
+    out["tb_polarity"] = pd.to_numeric(out["tb_polarity"], errors="coerce").fillna(0)
+    return out
 
 @st.cache_resource
 def get_connection():
@@ -77,6 +130,7 @@ auto_refresh = st.sidebar.checkbox("Auto-refresh (60s)", value=False)
 if auto_refresh:
     time.sleep(60)
     st.rerun()
+uploaded_file = st.sidebar.file_uploader("Use CSV instead of PostgreSQL", type=["csv"])
 
 try:
     conn = get_connection()
@@ -92,13 +146,17 @@ selected = st.sidebar.multiselect(
 )
 
 # ─── Load Data ───────────────────────────────────────────────────────────────
-try:
-    df = load_data(hours_back, selected if selected else None)
+if uploaded_file is not None:
+    df = build_uploaded_dataframe(uploaded_file)
     data_ok = len(df) > 0
-except Exception as e:
-    st.error(f"DB connection failed: {e}")
-    st.info("Make sure PostgreSQL is running and .env is configured correctly.")
-    st.stop()
+else:
+    try:
+        df = load_data(hours_back, selected if selected else None)
+        data_ok = len(df) > 0
+    except Exception as e:
+        st.error(f"DB connection failed: {e}")
+        st.info("Upload a CSV from the sidebar or make sure PostgreSQL is running and .env is configured correctly.")
+        st.stop()
 
 # ─── Header ──────────────────────────────────────────────────────────────────
 st.title("🔶 Hacker News Sentiment Analysis Pipeline")
